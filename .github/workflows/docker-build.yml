@@ -1,0 +1,98 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ['v*']
+  pull_request:
+    branches: [main, dev]
+  repository_dispatch:
+    types: [core-updated]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # Checkout both repos side by side so Dockerfile can COPY from both
+      # (Dockerfile uses: COPY wesense-ingester-core/ and COPY wesense-zenoh-bridge/)
+      - name: Checkout ingester
+        uses: actions/checkout@v4
+        with:
+          path: wesense-zenoh-bridge
+
+      - name: Determine core branch
+        id: core-branch
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "ref=${{ github.event.client_payload.core_branch || 'main' }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout core library (matching branch, fallback to main)
+        id: checkout-core
+        uses: actions/checkout@v4
+        with:
+          repository: wesense-earth/wesense-ingester-core
+          token: ${{ secrets.CORE_REPO_TOKEN }}
+          ref: ${{ steps.core-branch.outputs.ref }}
+          path: wesense-ingester-core
+        continue-on-error: true
+
+      - name: Fallback to core main branch
+        if: steps.checkout-core.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          repository: wesense-earth/wesense-ingester-core
+          token: ${{ secrets.CORE_REPO_TOKEN }}
+          ref: main
+          path: wesense-ingester-core
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: wesense-zenoh-bridge/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
