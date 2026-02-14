@@ -109,17 +109,14 @@ class ZenohBridge:
         self.trust_store.load()
         self.logger.info("Trust store loaded from %s", TRUST_FILE)
 
-        # OrbitDB registry (optional — trust sync only, observer doesn't register)
+        # OrbitDB registry — trust sync only (bridge doesn't register, it's not an ingester)
         registry_config = RegistryConfig.from_env()
-        if registry_config.enabled:
-            self.registry_client = RegistryClient(
-                config=registry_config,
-                trust_store=self.trust_store,
-            )
-            self.registry_client.start_trust_sync()
-            self.logger.info("OrbitDB trust sync enabled (observer mode)")
-        else:
-            self.registry_client = None
+        self.registry_client = RegistryClient(
+            config=registry_config,
+            trust_store=self.trust_store,
+        )
+        self.registry_client.start_trust_sync()
+        self.logger.info("OrbitDB trust sync active")
 
         # Dedup cache — mesh flooding protection
         self.dedup = DeduplicationCache()
@@ -253,7 +250,7 @@ class ZenohBridge:
         self.logger.info("Shutting down...")
         self.running = False
 
-        if hasattr(self, 'registry_client') and self.registry_client:
+        if hasattr(self, 'registry_client'):
             self.registry_client.close()
         if hasattr(self, 'subscriber'):
             self.subscriber.close()
