@@ -56,6 +56,7 @@ BRIDGE_COLUMNS = [
     "board_model", "sensor_model", "deployment_type", "deployment_type_source",
     "transport_type", "deployment_location", "node_name", "node_info", "node_info_url",
     "signature", "ingester_id", "key_version",
+    "received_via",
 ]
 
 
@@ -296,6 +297,7 @@ class ZenohBridge:
             signature,
             ingester_id,
             key_version,
+            "p2p",
         )
         self.ch_writer.add(row)
         self.stats["written"] += 1
