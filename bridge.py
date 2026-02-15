@@ -18,6 +18,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -45,6 +46,7 @@ STATS_INTERVAL = int(os.getenv("STATS_INTERVAL", "60"))
 TRUST_FILE = os.getenv("TRUST_FILE", "data/trust_list.json")
 SUBSCRIBE_KEY = os.getenv("ZENOH_SUBSCRIBE_KEY", "wesense/v2/live/**")
 LOCAL_KEY_DIRS = os.getenv("LOCAL_KEY_DIRS", "/app/local-keys")
+PEER_DISCOVERY_INTERVAL = int(os.getenv("PEER_DISCOVERY_INTERVAL", "120"))
 
 # ClickHouse columns (25-column unified schema)
 BRIDGE_COLUMNS = [
@@ -109,14 +111,17 @@ class ZenohBridge:
         self.trust_store.load()
         self.logger.info("Trust store loaded from %s", TRUST_FILE)
 
-        # OrbitDB registry — trust sync only (bridge doesn't register, it's not an ingester)
+        # OrbitDB registry (optional — trust sync only, observer doesn't register)
         registry_config = RegistryConfig.from_env()
-        self.registry_client = RegistryClient(
-            config=registry_config,
-            trust_store=self.trust_store,
-        )
-        self.registry_client.start_trust_sync()
-        self.logger.info("OrbitDB trust sync active")
+        if registry_config.enabled:
+            self.registry_client = RegistryClient(
+                config=registry_config,
+                trust_store=self.trust_store,
+            )
+            self.registry_client.start_trust_sync()
+            self.logger.info("OrbitDB trust sync enabled (observer mode)")
+        else:
+            self.registry_client = None
 
         # Dedup cache — mesh flooding protection
         self.dedup = DeduplicationCache()
@@ -131,13 +136,18 @@ class ZenohBridge:
             self.logger.error("Failed to connect to ClickHouse: %s", e)
             sys.exit(1)
 
-        # Zenoh subscriber
+        # Zenoh subscriber (local zenohd)
         zenoh_config = ZenohConfig.from_env()
         self.subscriber = ZenohSubscriber(
             config=zenoh_config,
             trust_store=self.trust_store,
             on_reading=self._on_reading,
         )
+
+        # Remote peer discovery via OrbitDB node registry
+        self._remote_subscribers: dict[str, ZenohSubscriber] = {}
+        self._discovery_thread: threading.Thread | None = None
+        self._discovery_stop = threading.Event()
 
         # Stats
         self.stats = {
@@ -147,6 +157,69 @@ class ZenohBridge:
             "unsigned": 0,
             "self_echo": 0,
         }
+
+    def _start_peer_discovery(self):
+        """Start background thread that discovers remote Zenoh routers from OrbitDB."""
+        if not self.registry_client:
+            return
+
+        def _discovery_loop():
+            # Initial delay — let local Zenoh settle
+            self._discovery_stop.wait(timeout=30)
+            while not self._discovery_stop.is_set():
+                try:
+                    self._discover_peers()
+                except Exception as e:
+                    self.logger.warning("Peer discovery error: %s", e)
+                self._discovery_stop.wait(timeout=PEER_DISCOVERY_INTERVAL)
+
+        self._discovery_thread = threading.Thread(
+            target=_discovery_loop, daemon=True, name="zenoh-peer-discovery"
+        )
+        self._discovery_thread.start()
+        self.logger.info(
+            "Zenoh peer discovery started (interval=%ds)", PEER_DISCOVERY_INTERVAL
+        )
+
+    def _discover_peers(self):
+        """Fetch remote zenoh_endpoints from OrbitDB and connect to new ones."""
+        endpoints = self.registry_client.discover_zenoh_peers(
+            exclude_ids=self._local_ingester_ids,
+        )
+
+        # Connect to newly discovered endpoints
+        for ep in endpoints:
+            if ep in self._remote_subscribers:
+                continue
+
+            self.logger.info("Discovered remote Zenoh peer: %s", ep)
+            try:
+                remote_config = ZenohConfig(
+                    enabled=True,
+                    mode="client",
+                    routers=[ep],
+                )
+                remote_sub = ZenohSubscriber(
+                    config=remote_config,
+                    trust_store=self.trust_store,
+                    on_reading=self._on_reading,
+                )
+                remote_sub.connect()
+                if remote_sub.is_connected():
+                    remote_sub.subscribe(SUBSCRIBE_KEY)
+                    self._remote_subscribers[ep] = remote_sub
+                    self.logger.info("Connected to remote Zenoh peer: %s", ep)
+                else:
+                    self.logger.warning("Failed to connect to remote peer: %s", ep)
+            except Exception as e:
+                self.logger.warning("Failed to connect to %s: %s", ep, e)
+
+        # Clean up disconnected peers
+        for ep, sub in list(self._remote_subscribers.items()):
+            if not sub.is_connected():
+                self.logger.info("Remote peer disconnected: %s", ep)
+                sub.close()
+                del self._remote_subscribers[ep]
 
     def _on_reading(self, reading_dict, signed_reading):
         """Callback invoked by ZenohSubscriber for each verified reading."""
@@ -234,7 +307,7 @@ class ZenohBridge:
 
         self.logger.info(
             "STATS | received=%d | written=%d | duplicates=%d | self_echo=%d | unsigned=%d | "
-            "sub_verified=%d | sub_rejected=%d | ch_written=%d | ch_buffer=%d",
+            "sub_verified=%d | sub_rejected=%d | ch_written=%d | ch_buffer=%d | remote_peers=%d",
             self.stats["received"],
             self.stats["written"],
             self.stats["duplicates"],
@@ -244,13 +317,20 @@ class ZenohBridge:
             sub_stats.get("rejected", 0),
             ch_stats.get("total_written", 0),
             ch_stats.get("buffer_size", 0),
+            len(self._remote_subscribers),
         )
 
     def shutdown(self, signum=None, frame=None):
         self.logger.info("Shutting down...")
         self.running = False
 
-        if hasattr(self, 'registry_client'):
+        self._discovery_stop.set()
+        if self._discovery_thread:
+            self._discovery_thread.join(timeout=5)
+        for sub in self._remote_subscribers.values():
+            sub.close()
+        self._remote_subscribers.clear()
+        if hasattr(self, 'registry_client') and self.registry_client:
             self.registry_client.close()
         if hasattr(self, 'subscriber'):
             self.subscriber.close()
@@ -270,6 +350,9 @@ class ZenohBridge:
 
         self.subscriber.connect()
         self.subscriber.subscribe(SUBSCRIBE_KEY)
+
+        # Start discovering remote Zenoh peers from OrbitDB node registry
+        self._start_peer_discovery()
 
         try:
             while self.running:
