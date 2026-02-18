@@ -103,7 +103,6 @@ jobs:
           account: ${{ github.repository_owner }}
           token: ${{ secrets.GITHUB_TOKEN }}
           image-names: ${{ github.event.repository.name }}
-          cut-off: 7 days ago UTC
+          cut-off: 7d
           keep-n-most-recent: 3
           tag-selection: both
-          account-type: org
