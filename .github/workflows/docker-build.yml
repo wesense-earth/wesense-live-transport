@@ -83,6 +83,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.core-branch.outputs.ref }},enable=${{ github.event_name == 'repository_dispatch' }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
