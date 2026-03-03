@@ -21,6 +21,8 @@ RUN apt-get update && \
 
 # Copy application code
 COPY wesense-zenoh-bridge/bridge.py .
+COPY wesense-zenoh-bridge/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # Copy sample trust list
 COPY wesense-zenoh-bridge/trust_list.json data/trust_list.json
@@ -30,4 +32,4 @@ RUN mkdir -p /app/data /app/logs /app/local-keys
 
 ENV TZ=UTC
 
-CMD ["python", "-u", "bridge.py"]
+ENTRYPOINT ["/app/entrypoint.sh"]
