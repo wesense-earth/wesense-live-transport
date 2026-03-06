@@ -47,6 +47,7 @@ TRUST_FILE = os.getenv("TRUST_FILE", "data/trust_list.json")
 SUBSCRIBE_KEY = os.getenv("ZENOH_SUBSCRIBE_KEY", "wesense/v2/live/**")
 LOCAL_KEY_DIRS = os.getenv("LOCAL_KEY_DIRS", "/app/local-keys")
 PEER_DISCOVERY_INTERVAL = int(os.getenv("PEER_DISCOVERY_INTERVAL", "120"))
+BRIDGE_API_PORT = int(os.getenv("BRIDGE_API_PORT", "5300"))
 
 # ClickHouse columns (25-column unified schema)
 BRIDGE_COLUMNS = [
@@ -341,6 +342,55 @@ class ZenohBridge:
 
         self.logger.info("Shutdown complete")
 
+    def _get_stats_json(self) -> bytes:
+        """Build JSON stats payload."""
+        import json
+        sub_stats = self.subscriber.stats
+        ch_stats = self.ch_writer.get_stats()
+        return json.dumps({
+            "received": self.stats["received"],
+            "written": self.stats["written"],
+            "duplicates": self.stats["duplicates"],
+            "self_echo": self.stats["self_echo"],
+            "unsigned": self.stats["unsigned"],
+            "sub_verified": sub_stats.get("verified", 0),
+            "sub_rejected": sub_stats.get("rejected", 0),
+            "ch_written": ch_stats.get("total_written", 0),
+            "ch_buffer": ch_stats.get("buffer_size", 0),
+            "remote_peers": len(self._remote_subscribers),
+            "remote_endpoints": list(self._remote_subscribers.keys()),
+        }).encode()
+
+    def _start_stats_api(self):
+        """Start a lightweight HTTP server exposing bridge stats (stdlib only)."""
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+
+        bridge = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/stats":
+                    body = bridge._get_stats_json()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_error(404)
+
+            def log_message(self, format, *args):
+                pass  # suppress request logging
+
+        server = HTTPServer(("0.0.0.0", BRIDGE_API_PORT), Handler)
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+            name="bridge-stats-api",
+        )
+        thread.start()
+        self.logger.info("Stats API listening on port %d", BRIDGE_API_PORT)
+
     def run(self):
         signal.signal(signal.SIGINT, self.shutdown)
         signal.signal(signal.SIGTERM, self.shutdown)
@@ -355,6 +405,9 @@ class ZenohBridge:
 
         # Start discovering remote Zenoh peers from OrbitDB node registry
         self._start_peer_discovery()
+
+        # Start HTTP stats endpoint
+        self._start_stats_api()
 
         try:
             while self.running:
