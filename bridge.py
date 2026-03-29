@@ -150,15 +150,36 @@ class ZenohBridge:
         self.trust_store.load()
         self.logger.info("Trust store loaded from %s", TRUST_FILE)
 
-        # OrbitDB registry (optional — trust sync only, observer doesn't register)
+        # OrbitDB registry — register bridge's key + zenoh endpoint for peer discovery
         registry_config = RegistryConfig.from_env()
         if registry_config.enabled:
             self.registry_client = RegistryClient(
                 config=registry_config,
                 trust_store=self.trust_store,
             )
+
+            # Build zenoh_endpoint metadata for WAN + LAN discovery
+            reg_metadata = {}
+            announce_addr = os.getenv("ANNOUNCE_ADDRESS", "")
+            zenoh_announce = os.getenv("ZENOH_LAN_ADDRESS", "")
+            zenoh_port = os.getenv("PORT_ZENOH", "7447")
+            if announce_addr:
+                reg_metadata["zenoh_endpoint"] = f"tcp/{announce_addr}:{zenoh_port}"
+            if zenoh_announce and zenoh_announce != announce_addr:
+                reg_metadata["zenoh_endpoint_lan"] = f"tcp/{zenoh_announce}:{zenoh_port}"
+
+            try:
+                self.registry_client.register_node(
+                    ingester_id=self._key_manager.ingester_id,
+                    public_key_bytes=self._key_manager.public_key_bytes,
+                    key_version=self._key_manager.key_version,
+                    **reg_metadata,
+                )
+            except Exception as e:
+                self.logger.warning("OrbitDB registration failed (%s), will retry on next trust sync", e)
+
             self.registry_client.start_trust_sync()
-            self.logger.info("OrbitDB trust sync enabled (observer mode)")
+            self.logger.info("OrbitDB registry — trust sync active, bridge registered")
         else:
             self.registry_client = None
 
