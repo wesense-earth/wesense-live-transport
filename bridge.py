@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-WeSense Zenoh Bridge — P2P Data Receiver
+WeSense Zenoh Bridge — Bidirectional MQTT ↔ Zenoh Bridge
 
-Subscribes to Zenoh, verifies signatures against a trust list,
-and writes incoming readings to the local ClickHouse instance.
+Outbound: subscribes to MQTT decoded readings from all local ingesters,
+signs them, and publishes to the Zenoh P2P network.
 
-This is the observer persona's data receiver: it does NOT re-sign readings.
-The original ingester's signature is preserved so that observer ClickHouse
-contains the same verifiable data as the station's.
+Inbound: subscribes to Zenoh, verifies signatures against a trust list,
+and writes incoming P2P readings to the local ClickHouse instance.
+
+This is the single point where MQTT world meets Zenoh world. Ingesters
+only need to publish decoded readings to MQTT — the bridge handles P2P
+distribution automatically.
 
 Usage:
     python bridge.py
 """
 
 import hashlib
+import json
 import logging
 import os
 import signal
@@ -34,11 +38,20 @@ from wesense_ingester import (
     setup_logging,
 )
 from wesense_ingester.clickhouse.writer import ClickHouseConfig
+from wesense_ingester.signing.keys import IngesterKeyManager, KeyConfig
+from wesense_ingester.signing.signer import ReadingSigner
 from wesense_ingester.signing.trust import TrustStore
 from wesense_ingester.registry.config import RegistryConfig
 from wesense_ingester.registry.client import RegistryClient
 from wesense_ingester.zenoh.config import ZenohConfig
+from wesense_ingester.zenoh.publisher import ZenohPublisher
 from wesense_ingester.zenoh.subscriber import ZenohSubscriber
+
+try:
+    import paho.mqtt.client as mqtt
+    _MQTT_AVAILABLE = True
+except ImportError:
+    _MQTT_AVAILABLE = False
 
 # ── Configuration ─────────────────────────────────────────────────────
 
@@ -48,6 +61,14 @@ SUBSCRIBE_KEY = os.getenv("ZENOH_SUBSCRIBE_KEY", "wesense/v2/live/**")
 LOCAL_KEY_DIRS = os.getenv("LOCAL_KEY_DIRS", "/app/local-keys")
 PEER_DISCOVERY_INTERVAL = int(os.getenv("PEER_DISCOVERY_INTERVAL", "120"))
 BRIDGE_API_PORT = int(os.getenv("BRIDGE_API_PORT", "5300"))
+
+# MQTT outbound config
+MQTT_BRIDGE_ENABLED = os.getenv("MQTT_BRIDGE_ENABLED", "true").lower() in ("true", "1", "yes")
+MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_USERNAME = os.getenv("MQTT_USERNAME")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
+MQTT_SUBSCRIBE_TOPIC = os.getenv("MQTT_SUBSCRIBE_TOPIC", "wesense/decoded/#")
 
 # ClickHouse columns (25-column unified schema)
 BRIDGE_COLUMNS = [
@@ -93,7 +114,10 @@ def _scan_local_ingester_ids(scan_dirs: str) -> set[str]:
 
 class ZenohBridge:
     """
-    P2P data receiver: subscribe to Zenoh, verify signatures, write to ClickHouse.
+    Bidirectional MQTT ↔ Zenoh bridge.
+
+    Outbound: MQTT decoded/# → sign → Zenoh wesense/v2/live/**
+    Inbound:  Zenoh wesense/v2/live/** → verify → ClickHouse (received_via=p2p)
     """
 
     def __init__(self):
@@ -107,6 +131,19 @@ class ZenohBridge:
                 "Self-echo filter active — skipping local ingesters: %s",
                 ", ".join(sorted(self._local_ingester_ids)),
             )
+
+        # Bridge signing key (auto-generated on first run)
+        key_config = KeyConfig(
+            key_dir=os.getenv("ZENOH_KEY_DIR", "data/keys"),
+            key_file="bridge_key.pem",
+        )
+        self._key_manager = IngesterKeyManager(config=key_config)
+        self._key_manager.load_or_generate()
+        self._signer = ReadingSigner(self._key_manager)
+        self.logger.info("Bridge signing identity: %s", self._key_manager.ingester_id)
+
+        # Add bridge's own key to self-echo filter
+        self._local_ingester_ids.add(self._key_manager.ingester_id)
 
         # Trust store for signature verification
         self.trust_store = TrustStore(trust_file=TRUST_FILE)
@@ -138,18 +175,31 @@ class ZenohBridge:
             self.logger.error("Failed to connect to ClickHouse: %s", e)
             sys.exit(1)
 
-        # Zenoh subscriber (local zenohd)
+        # ── Inbound: Zenoh subscriber (receives P2P readings) ──
         zenoh_config = ZenohConfig.from_env()
         self.subscriber = ZenohSubscriber(
             config=zenoh_config,
             trust_store=self.trust_store,
-            on_reading=self._on_reading,
+            on_reading=self._on_inbound_reading,
         )
 
         # Remote peer discovery via OrbitDB node registry
         self._remote_subscribers: dict[str, ZenohSubscriber] = {}
         self._discovery_thread: threading.Thread | None = None
         self._discovery_stop = threading.Event()
+
+        # ── Outbound: MQTT subscriber → Zenoh publisher ──
+        self._mqtt_client: mqtt.Client | None = None
+        self._mqtt_connected = False
+        self.zenoh_publisher: ZenohPublisher | None = None
+
+        if MQTT_BRIDGE_ENABLED and _MQTT_AVAILABLE:
+            self.zenoh_publisher = ZenohPublisher(
+                config=zenoh_config,
+                signer=self._signer,
+            )
+        elif MQTT_BRIDGE_ENABLED and not _MQTT_AVAILABLE:
+            self.logger.warning("MQTT bridge enabled but paho-mqtt not available")
 
         # Stats
         self.stats = {
@@ -158,76 +208,77 @@ class ZenohBridge:
             "duplicates": 0,
             "unsigned": 0,
             "self_echo": 0,
+            "mqtt_received": 0,
+            "mqtt_published": 0,
         }
 
-    def _start_peer_discovery(self):
-        """Start background thread that discovers remote Zenoh routers from OrbitDB."""
-        if not self.registry_client:
+    # ── Outbound: MQTT → Zenoh ────────────────────────────────────────
+
+    def _start_mqtt_subscriber(self):
+        """Subscribe to local MQTT decoded readings and forward to Zenoh."""
+        if not MQTT_BRIDGE_ENABLED or not _MQTT_AVAILABLE:
+            self.logger.info("MQTT→Zenoh outbound bridge disabled")
             return
 
-        def _discovery_loop():
-            # Initial delay — let local Zenoh settle
-            self._discovery_stop.wait(timeout=30)
-            while not self._discovery_stop.is_set():
-                try:
-                    self._discover_peers()
-                except Exception as e:
-                    self.logger.warning("Peer discovery error: %s", e)
-                self._discovery_stop.wait(timeout=PEER_DISCOVERY_INTERVAL)
+        self.zenoh_publisher.connect()
 
-        self._discovery_thread = threading.Thread(
-            target=_discovery_loop, daemon=True, name="zenoh-peer-discovery"
+        self._mqtt_client = mqtt.Client(
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+            client_id="wesense-zenoh-bridge",
         )
-        self._discovery_thread.start()
+
+        if MQTT_USERNAME:
+            self._mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+
+        self._mqtt_client.on_connect = self._mqtt_on_connect
+        self._mqtt_client.on_disconnect = self._mqtt_on_disconnect
+        self._mqtt_client.on_message = self._mqtt_on_message
+
+        try:
+            self._mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+            self._mqtt_client.loop_start()
+            self.logger.info(
+                "MQTT outbound bridge connecting to %s:%d (topic: %s)",
+                MQTT_BROKER, MQTT_PORT, MQTT_SUBSCRIBE_TOPIC,
+            )
+        except Exception as e:
+            self.logger.error("MQTT connection failed: %s", e)
+            self._mqtt_client = None
+
+    def _mqtt_on_connect(self, client, userdata, flags, rc, properties=None):
+        self._mqtt_connected = True
+        client.subscribe(MQTT_SUBSCRIBE_TOPIC)
         self.logger.info(
-            "Zenoh peer discovery started (interval=%ds)", PEER_DISCOVERY_INTERVAL
+            "MQTT outbound bridge connected, subscribed to %s", MQTT_SUBSCRIBE_TOPIC
         )
 
-    def _discover_peers(self):
-        """Fetch remote zenoh_endpoints from OrbitDB and connect to new ones."""
-        endpoints = self.registry_client.discover_zenoh_peers(
-            exclude_ids=self._local_ingester_ids,
-        )
+    def _mqtt_on_disconnect(self, client, userdata, flags, rc, properties=None):
+        self._mqtt_connected = False
+        self.logger.warning("MQTT outbound bridge disconnected (rc=%s)", rc)
 
-        # Connect to newly discovered endpoints
-        for ep in endpoints:
-            if ep in self._remote_subscribers:
-                continue
+    def _mqtt_on_message(self, client, userdata, msg):
+        """Forward decoded MQTT reading to Zenoh."""
+        self.stats["mqtt_received"] += 1
 
-            self.logger.info("Discovered remote Zenoh peer: %s", ep)
-            try:
-                remote_config = ZenohConfig(
-                    enabled=True,
-                    mode="client",
-                    routers=[ep],
-                )
-                remote_sub = ZenohSubscriber(
-                    config=remote_config,
-                    trust_store=self.trust_store,
-                    on_reading=self._on_reading,
-                )
-                remote_sub.connect()
-                if remote_sub.is_connected():
-                    remote_sub.subscribe(SUBSCRIBE_KEY)
-                    self._remote_subscribers[ep] = remote_sub
-                    self.logger.info("Connected to remote Zenoh peer: %s", ep)
-                else:
-                    self.logger.warning("Failed to connect to remote peer: %s", ep)
-            except Exception as e:
-                self.logger.warning("Failed to connect to %s: %s", ep, e)
+        try:
+            reading = json.loads(msg.payload)
+        except (json.JSONDecodeError, ValueError):
+            return
 
-        # Clean up disconnected peers
-        for ep, sub in list(self._remote_subscribers.items()):
-            if not sub.is_connected():
-                self.logger.info("Remote peer disconnected: %s", ep)
-                sub.close()
-                del self._remote_subscribers[ep]
+        if not isinstance(reading, dict) or not reading.get("device_id"):
+            return
 
-    def _on_reading(self, reading_dict, signed_reading):
+        if self.zenoh_publisher and self.zenoh_publisher.is_connected():
+            if self.zenoh_publisher.publish_reading(reading):
+                self.stats["mqtt_published"] += 1
+
+    # ── Inbound: Zenoh → ClickHouse ──────────────────────────────────
+
+    def _on_inbound_reading(self, reading_dict, signed_reading):
         """Callback invoked by ZenohSubscriber for each verified reading."""
         self.stats["received"] += 1
 
-        # Self-echo filter: skip readings from this station's own ingesters
+        # Self-echo filter: skip readings from this station's own ingesters or bridge
         if (
             signed_reading
             and signed_reading.ingester_id in self._local_ingester_ids
@@ -303,19 +354,89 @@ class ZenohBridge:
         self.ch_writer.add(row)
         self.stats["written"] += 1
 
+    # ── Peer Discovery ────────────────────────────────────────────────
+
+    def _start_peer_discovery(self):
+        """Start background thread that discovers remote Zenoh routers from OrbitDB."""
+        if not self.registry_client:
+            return
+
+        def _discovery_loop():
+            # Initial delay — let local Zenoh settle
+            self._discovery_stop.wait(timeout=30)
+            while not self._discovery_stop.is_set():
+                try:
+                    self._discover_peers()
+                except Exception as e:
+                    self.logger.warning("Peer discovery error: %s", e)
+                self._discovery_stop.wait(timeout=PEER_DISCOVERY_INTERVAL)
+
+        self._discovery_thread = threading.Thread(
+            target=_discovery_loop, daemon=True, name="zenoh-peer-discovery"
+        )
+        self._discovery_thread.start()
+        self.logger.info(
+            "Zenoh peer discovery started (interval=%ds)", PEER_DISCOVERY_INTERVAL
+        )
+
+    def _discover_peers(self):
+        """Fetch remote zenoh_endpoints from OrbitDB and connect to new ones."""
+        endpoints = self.registry_client.discover_zenoh_peers(
+            exclude_ids=self._local_ingester_ids,
+        )
+
+        # Connect to newly discovered endpoints
+        for ep in endpoints:
+            if ep in self._remote_subscribers:
+                continue
+
+            self.logger.info("Discovered remote Zenoh peer: %s", ep)
+            try:
+                remote_config = ZenohConfig(
+                    enabled=True,
+                    mode="client",
+                    routers=[ep],
+                )
+                remote_sub = ZenohSubscriber(
+                    config=remote_config,
+                    trust_store=self.trust_store,
+                    on_reading=self._on_inbound_reading,
+                )
+                remote_sub.connect()
+                if remote_sub.is_connected():
+                    remote_sub.subscribe(SUBSCRIBE_KEY)
+                    self._remote_subscribers[ep] = remote_sub
+                    self.logger.info("Connected to remote Zenoh peer: %s", ep)
+                else:
+                    self.logger.warning("Failed to connect to remote peer: %s", ep)
+            except Exception as e:
+                self.logger.warning("Failed to connect to %s: %s", ep, e)
+
+        # Clean up disconnected peers
+        for ep, sub in list(self._remote_subscribers.items()):
+            if not sub.is_connected():
+                self.logger.info("Remote peer disconnected: %s", ep)
+                sub.close()
+                del self._remote_subscribers[ep]
+
+    # ── Stats & API ───────────────────────────────────────────────────
+
     def print_stats(self):
         sub_stats = self.subscriber.stats
         ch_stats = self.ch_writer.get_stats()
         dedup_stats = self.dedup.get_stats()
 
         self.logger.info(
-            "STATS | received=%d | written=%d | duplicates=%d | self_echo=%d | unsigned=%d | "
-            "sub_verified=%d | sub_rejected=%d | ch_written=%d | ch_buffer=%d | remote_peers=%d",
+            "STATS | inbound: received=%d written=%d duplicates=%d self_echo=%d unsigned=%d | "
+            "outbound: mqtt_received=%d zenoh_published=%d | "
+            "sub_verified=%d sub_rejected=%d | ch_written=%d ch_buffer=%d | remote_peers=%d",
             self.stats["received"],
             self.stats["written"],
             self.stats["duplicates"],
             self.stats["self_echo"],
             self.stats["unsigned"],
+            self.stats["mqtt_received"],
+            self.stats["mqtt_published"],
             sub_stats.get("verified", 0),
             sub_stats.get("rejected", 0),
             ch_stats.get("total_written", 0),
@@ -327,6 +448,14 @@ class ZenohBridge:
         self.logger.info("Shutting down...")
         self.running = False
 
+        # Outbound cleanup
+        if self._mqtt_client:
+            self._mqtt_client.loop_stop()
+            self._mqtt_client.disconnect()
+        if self.zenoh_publisher:
+            self.zenoh_publisher.close()
+
+        # Inbound cleanup
         self._discovery_stop.set()
         if self._discovery_thread:
             self._discovery_thread.join(timeout=5)
@@ -344,7 +473,6 @@ class ZenohBridge:
 
     def _get_stats_json(self) -> bytes:
         """Build JSON stats payload."""
-        import json
         sub_stats = self.subscriber.stats
         ch_stats = self.ch_writer.get_stats()
         return json.dumps({
@@ -353,12 +481,16 @@ class ZenohBridge:
             "duplicates": self.stats["duplicates"],
             "self_echo": self.stats["self_echo"],
             "unsigned": self.stats["unsigned"],
+            "mqtt_received": self.stats["mqtt_received"],
+            "mqtt_published": self.stats["mqtt_published"],
             "sub_verified": sub_stats.get("verified", 0),
             "sub_rejected": sub_stats.get("rejected", 0),
             "ch_written": ch_stats.get("total_written", 0),
             "ch_buffer": ch_stats.get("buffer_size", 0),
             "remote_peers": len(self._remote_subscribers),
             "remote_endpoints": list(self._remote_subscribers.keys()),
+            "mqtt_connected": self._mqtt_connected,
+            "bridge_id": self._key_manager.ingester_id,
         }).encode()
 
     def _start_stats_api(self):
@@ -391,17 +523,26 @@ class ZenohBridge:
         thread.start()
         self.logger.info("Stats API listening on port %d", BRIDGE_API_PORT)
 
+    # ── Main Loop ─────────────────────────────────────────────────────
+
     def run(self):
         signal.signal(signal.SIGINT, self.shutdown)
         signal.signal(signal.SIGTERM, self.shutdown)
 
         self.logger.info("=" * 60)
-        self.logger.info("WeSense Zenoh Bridge (P2P Data Receiver)")
-        self.logger.info("Subscribing to: %s", SUBSCRIBE_KEY)
+        self.logger.info("WeSense Zenoh Bridge (Bidirectional MQTT ↔ Zenoh)")
+        self.logger.info("Inbound:  Zenoh %s → ClickHouse", SUBSCRIBE_KEY)
+        if MQTT_BRIDGE_ENABLED:
+            self.logger.info("Outbound: MQTT %s → Zenoh", MQTT_SUBSCRIBE_TOPIC)
+        self.logger.info("Bridge identity: %s", self._key_manager.ingester_id)
         self.logger.info("=" * 60)
 
+        # Start inbound Zenoh subscriber
         self.subscriber.connect()
         self.subscriber.subscribe(SUBSCRIBE_KEY)
+
+        # Start outbound MQTT→Zenoh bridge
+        self._start_mqtt_subscriber()
 
         # Start discovering remote Zenoh peers from OrbitDB node registry
         self._start_peer_discovery()
