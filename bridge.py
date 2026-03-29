@@ -148,7 +148,15 @@ class ZenohBridge:
         # Trust store for signature verification
         self.trust_store = TrustStore(trust_file=TRUST_FILE)
         self.trust_store.load()
-        self.logger.info("Trust store loaded from %s", TRUST_FILE)
+
+        # Add bridge's own key to trust store so the local Zenoh subscriber
+        # can verify (and then self-echo filter) the bridge's own outbound readings
+        self.trust_store.add_trusted(
+            ingester_id=self._key_manager.ingester_id,
+            public_key_bytes=self._key_manager.public_key_bytes,
+            key_version=self._key_manager.key_version,
+        )
+        self.logger.info("Trust store loaded from %s (+ bridge key)", TRUST_FILE)
 
         # OrbitDB registry — register bridge's key + zenoh endpoint for peer discovery
         registry_config = RegistryConfig.from_env()
