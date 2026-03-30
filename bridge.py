@@ -181,7 +181,8 @@ class ZenohBridge:
                         "Proxy mode active (ZENOH_PROXY_ROUTER=%s) — ignoring ANNOUNCE_ADDRESS=%s",
                         proxy_router, announce_addr,
                     )
-                reg_metadata["zenoh_proxy"] = proxy_router
+                # Don't write the proxy LAN address to OrbitDB — it's a local config
+                # detail, not network state. Other stations don't need to know it.
                 self.logger.info("Station mode: proxied via %s", proxy_router)
             elif announce_addr:
                 # Public station: directly reachable from the internet.
