@@ -166,15 +166,29 @@ class ZenohBridge:
                 trust_store=self.trust_store,
             )
 
-            # Build zenoh_endpoint metadata for WAN + LAN discovery
-            reg_metadata = {}
+            # Determine station mode: public (direct) or proxied
+            proxy_router = os.getenv("ZENOH_PROXY_ROUTER", "")
             announce_addr = os.getenv("ANNOUNCE_ADDRESS", "")
-            zenoh_announce = os.getenv("ZENOH_LAN_ADDRESS", "")
             zenoh_port = os.getenv("PORT_ZENOH", "7447")
-            if announce_addr:
+
+            reg_metadata = {}
+            if proxy_router:
+                # Proxied station: all Zenoh traffic flows through the proxy router.
+                # Do NOT register zenoh_endpoint — this station is not directly reachable.
+                # ANNOUNCE_ADDRESS is ignored in proxy mode (safety guard for role changes).
+                if announce_addr:
+                    self.logger.info(
+                        "Proxy mode active (ZENOH_PROXY_ROUTER=%s) — ignoring ANNOUNCE_ADDRESS=%s",
+                        proxy_router, announce_addr,
+                    )
+                reg_metadata["zenoh_proxy"] = proxy_router
+                self.logger.info("Station mode: proxied via %s", proxy_router)
+            elif announce_addr:
+                # Public station: directly reachable from the internet.
                 reg_metadata["zenoh_endpoint"] = f"tcp/{announce_addr}:{zenoh_port}"
-            if zenoh_announce and zenoh_announce != announce_addr:
-                reg_metadata["zenoh_endpoint_lan"] = f"tcp/{zenoh_announce}:{zenoh_port}"
+                self.logger.info("Station mode: public (%s:%s)", announce_addr, zenoh_port)
+            else:
+                self.logger.info("Station mode: local only (no ANNOUNCE_ADDRESS or ZENOH_PROXY_ROUTER)")
 
             try:
                 self.registry_client.register_node(
@@ -182,6 +196,18 @@ class ZenohBridge:
                     public_key_bytes=self._key_manager.public_key_bytes,
                     key_version=self._key_manager.key_version,
                     **reg_metadata,
+                )
+
+                # Clean up stale Zenoh entries from OrbitDB — remove zenoh_endpoint
+                # from any node entries belonging to THIS station. Uses the set of
+                # local ingester IDs (scanned from key files) to identify our entries.
+                # This handles:
+                #   1. Role changes (public → proxied): stale public endpoints
+                #   2. Old ingester registrations that embedded Zenoh (pre-decoupling)
+                self.registry_client.cleanup_stale_zenoh_entries(
+                    own_bridge_id=self._key_manager.ingester_id,
+                    local_ingester_ids=self._local_ingester_ids,
+                    is_proxied=bool(proxy_router),
                 )
             except Exception as e:
                 self.logger.warning("OrbitDB registration failed (%s), will retry on next trust sync", e)
