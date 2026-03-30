@@ -417,6 +417,12 @@ class ZenohBridge:
         if not self.registry_client:
             return
 
+        # Proxied stations don't need peer discovery — all P2P traffic flows
+        # through the local zenohd which connects to the proxy station's zenohd.
+        if os.getenv("ZENOH_PROXY_ROUTER", ""):
+            self.logger.info("Peer discovery skipped (proxied station — traffic flows via zenohd proxy)")
+            return
+
         def _discovery_loop():
             # Initial delay — let local Zenoh settle
             self._discovery_stop.wait(timeout=30)
