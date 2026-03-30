@@ -1,9 +1,9 @@
-# WeSense Zenoh Bridge — P2P Data Receiver
+# WeSense Zenoh Bridge — Bidirectional MQTT ↔ Zenoh Bridge
 # Build context: parent directory (side-by-side checkout)
 # CI checks out wesense-zenoh-bridge/ and wesense-ingester-core/ side by side.
 #
-# Subscribes to Zenoh, verifies signatures, writes to local ClickHouse.
-# Used by the observer persona to receive data from remote stations.
+# Outbound: MQTT decoded/# → sign → Zenoh P2P network
+# Inbound:  Zenoh → verify → ClickHouse (received_via=p2p)
 
 FROM python:3.11-slim
 
@@ -18,6 +18,9 @@ RUN apt-get update && \
     pip install --no-cache-dir "/tmp/wesense-ingester-core[p2p]" && \
     apt-get purge -y --auto-remove gcc && \
     rm -rf /var/lib/apt/lists/* /tmp/wesense-ingester-core
+
+# Bust cache for application code (set by CI via --build-arg)
+ARG CACHE_BUST=1
 
 # Copy application code
 COPY wesense-zenoh-bridge/bridge.py .
