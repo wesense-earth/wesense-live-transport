@@ -9,7 +9,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy dependency files first for better layer caching
+# Bust cache when ingester-core or bridge code changes (set by CI via --build-arg)
+ARG CACHE_BUST=1
+
+# Copy and install ingester-core (CACHE_BUST above ensures this isn't stale)
 COPY wesense-ingester-core/ /tmp/wesense-ingester-core/
 
 # Install gcc, build all pip packages, then remove gcc in one layer
@@ -18,9 +21,6 @@ RUN apt-get update && \
     pip install --no-cache-dir "/tmp/wesense-ingester-core[p2p]" && \
     apt-get purge -y --auto-remove gcc && \
     rm -rf /var/lib/apt/lists/* /tmp/wesense-ingester-core
-
-# Bust cache for application code (set by CI via --build-arg)
-ARG CACHE_BUST=1
 
 # Copy application code
 COPY wesense-zenoh-bridge/bridge.py .
