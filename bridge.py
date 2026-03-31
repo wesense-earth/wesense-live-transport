@@ -167,29 +167,27 @@ class ZenohBridge:
             )
 
             # Determine station mode: public (direct) or proxied
-            proxy_router = os.getenv("ZENOH_PROXY_ROUTER", "")
+            wesense_proxy = os.getenv("WESENSE_PROXY", "")
             announce_addr = os.getenv("ANNOUNCE_ADDRESS", "")
             zenoh_port = os.getenv("PORT_ZENOH", "7447")
 
             reg_metadata = {}
-            if proxy_router:
-                # Proxied station: all Zenoh traffic flows through the proxy router.
+            if wesense_proxy:
+                # Proxied station: all traffic flows through the proxy.
                 # Do NOT register zenoh_endpoint — this station is not directly reachable.
-                # ANNOUNCE_ADDRESS is ignored in proxy mode (safety guard for role changes).
+                # ANNOUNCE_ADDRESS is ignored when proxied (safety guard for role changes).
                 if announce_addr:
                     self.logger.info(
-                        "Proxy mode active (ZENOH_PROXY_ROUTER=%s) — ignoring ANNOUNCE_ADDRESS=%s",
-                        proxy_router, announce_addr,
+                        "Proxied (WESENSE_PROXY=%s) — ignoring ANNOUNCE_ADDRESS=%s",
+                        wesense_proxy, announce_addr,
                     )
-                # Don't write the proxy LAN address to OrbitDB — it's a local config
-                # detail, not network state. Other stations don't need to know it.
-                self.logger.info("Station mode: proxied via %s", proxy_router)
+                self.logger.info("Station mode: proxied via %s", wesense_proxy)
             elif announce_addr:
                 # Public station: directly reachable from the internet.
                 reg_metadata["zenoh_endpoint"] = f"tcp/{announce_addr}:{zenoh_port}"
                 self.logger.info("Station mode: public (%s:%s)", announce_addr, zenoh_port)
             else:
-                self.logger.info("Station mode: local only (no ANNOUNCE_ADDRESS or ZENOH_PROXY_ROUTER)")
+                self.logger.info("Station mode: local only (no ANNOUNCE_ADDRESS or WESENSE_PROXY)")
 
             try:
                 self.registry_client.register_node(
@@ -208,7 +206,7 @@ class ZenohBridge:
                 self.registry_client.cleanup_stale_zenoh_entries(
                     own_bridge_id=self._key_manager.ingester_id,
                     local_ingester_ids=self._local_ingester_ids,
-                    is_proxied=bool(proxy_router),
+                    is_proxied=bool(wesense_proxy),
                 )
             except Exception as e:
                 self.logger.warning("OrbitDB registration failed (%s), will retry on next trust sync", e)
@@ -419,7 +417,7 @@ class ZenohBridge:
 
         # Proxied stations don't need peer discovery — all P2P traffic flows
         # through the local zenohd which connects to the proxy station's zenohd.
-        if os.getenv("ZENOH_PROXY_ROUTER", ""):
+        if os.getenv("WESENSE_PROXY", ""):
             self.logger.info("Peer discovery skipped (proxied station — traffic flows via zenohd proxy)")
             return
 
