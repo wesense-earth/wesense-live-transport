@@ -1,6 +1,6 @@
-# WeSense Zenoh Bridge — Bidirectional MQTT ↔ Zenoh Bridge
+# WeSense Live Transport — Bidirectional MQTT ↔ Zenoh P2P
 # Build context: parent directory (side-by-side checkout)
-# CI checks out wesense-zenoh-bridge/ and wesense-ingester-core/ side by side.
+# CI checks out wesense-live-transport/ and wesense-ingester-core/ side by side.
 #
 # Outbound: MQTT decoded/# → sign → Zenoh P2P network
 # Inbound:  Zenoh → verify → ClickHouse (received_via=p2p)
@@ -23,12 +23,12 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* /tmp/wesense-ingester-core
 
 # Copy application code
-COPY wesense-zenoh-bridge/bridge.py .
-COPY wesense-zenoh-bridge/entrypoint.sh /app/entrypoint.sh
+COPY wesense-live-transport/bridge.py .
+COPY wesense-live-transport/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 # Copy sample trust list
-COPY wesense-zenoh-bridge/trust_list.json data/trust_list.json
+COPY wesense-live-transport/trust_list.json data/trust_list.json
 
 # Create directories for data, logs, and local keys (self-echo filter)
 RUN mkdir -p /app/data /app/logs /app/local-keys

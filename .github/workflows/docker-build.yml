@@ -33,7 +33,7 @@ jobs:
       - name: Checkout ingester
         uses: actions/checkout@v4
         with:
-          path: wesense-zenoh-bridge
+          path: wesense-live-transport
 
       - name: Determine core branch
         id: core-branch
@@ -90,7 +90,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: wesense-zenoh-bridge/Dockerfile
+          file: wesense-live-transport/Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |

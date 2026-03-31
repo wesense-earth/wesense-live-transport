@@ -278,7 +278,7 @@ class ZenohBridge:
 
         self._mqtt_client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-            client_id="wesense-zenoh-bridge",
+            client_id="wesense-live-transport",
         )
 
         if MQTT_USERNAME:
