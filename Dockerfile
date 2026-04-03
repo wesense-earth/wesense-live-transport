@@ -18,6 +18,7 @@ COPY wesense-ingester-core/ /tmp/wesense-ingester-core/
 # Install gcc, build all pip packages, then remove gcc in one layer
 RUN apt-get update && \
     apt-get install -y --no-install-recommends gcc && \
+    pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir "/tmp/wesense-ingester-core[p2p]" && \
     apt-get purge -y --auto-remove gcc && \
     rm -rf /var/lib/apt/lists/* /tmp/wesense-ingester-core
