@@ -575,13 +575,26 @@ class ZenohBridge:
                 pass  # suppress request logging
 
         server = HTTPServer(("0.0.0.0", BRIDGE_API_PORT), Handler)
+
+        # Wrap with TLS when enabled
+        tls_enabled = os.getenv("TLS_ENABLED", "").lower() == "true"
+        certfile = os.getenv("TLS_CERTFILE", "")
+        keyfile = os.getenv("TLS_KEYFILE", "")
+        if tls_enabled and certfile and keyfile and os.path.exists(certfile):
+            import ssl
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile, keyfile)
+            server.socket = ctx.wrap_socket(server.socket, server_side=True)
+            self.logger.info("Stats API listening on port %d (HTTPS)", BRIDGE_API_PORT)
+        else:
+            self.logger.info("Stats API listening on port %d", BRIDGE_API_PORT)
+
         thread = threading.Thread(
             target=server.serve_forever,
             daemon=True,
             name="bridge-stats-api",
         )
         thread.start()
-        self.logger.info("Stats API listening on port %d", BRIDGE_API_PORT)
 
     # ── Main Loop ─────────────────────────────────────────────────────
 
