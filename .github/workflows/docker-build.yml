@@ -30,11 +30,6 @@ jobs:
       packages: write
 
     steps:
-      - name: Checkout ingester
-        uses: actions/checkout@v4
-        with:
-          path: wesense-live-transport
-
       - name: Determine core branch
         id: core-branch
         run: |
@@ -43,6 +38,12 @@ jobs:
           else
             echo "ref=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Checkout ingester
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.core-branch.outputs.ref }}
+          path: wesense-live-transport
 
       - name: Checkout core library (matching branch, fallback to main)
         id: checkout-core
