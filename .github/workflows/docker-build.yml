@@ -6,8 +6,6 @@ on:
     tags: ['v*']
   pull_request:
     branches: [main, dev]
-  repository_dispatch:
-    types: [core-updated]
   workflow_dispatch:
 
 env:
@@ -30,14 +28,9 @@ jobs:
       packages: write
 
     steps:
-      - name: Determine core branch
+      - name: Determine branch
         id: core-branch
-        run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            echo "ref=${{ github.event.client_payload.core_branch || 'main' }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "ref=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          fi
+        run: echo "ref=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout ingester
         uses: actions/checkout@v4
@@ -142,14 +135,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Determine core branch
+      - name: Determine branch
         id: core-branch
-        run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            echo "ref=${{ github.event.client_payload.core_branch || 'main' }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "ref=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          fi
+        run: echo "ref=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata (tags)
         id: meta
