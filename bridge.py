@@ -3,7 +3,8 @@
 WeSense Zenoh Bridge — Bidirectional MQTT ↔ Zenoh Bridge
 
 Outbound: subscribes to MQTT decoded readings from all local ingesters,
-signs them, and publishes to the Zenoh P2P network.
+wraps them in a SignedReading envelope preserving the original ingester
+signature, and publishes to the Zenoh P2P network.
 
 Inbound: subscribes to Zenoh, verifies signatures against a trust list,
 and writes incoming P2P readings to the local ClickHouse instance.
@@ -38,6 +39,8 @@ from wesense_ingester import (
     setup_logging,
 )
 from wesense_ingester.clickhouse.writer import ClickHouseConfig
+from wesense_ingester.pipeline import CANONICAL_FIELDS, canonical_to_json
+from wesense_ingester.proto.signed_reading_pb2 import SignedReading
 from wesense_ingester.signing.keys import IngesterKeyManager, KeyConfig
 from wesense_ingester.signing.signer import ReadingSigner
 from wesense_ingester.signing.trust import TrustStore
@@ -70,15 +73,19 @@ MQTT_USERNAME = os.getenv("MQTT_USERNAME")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
 MQTT_SUBSCRIBE_TOPIC = os.getenv("MQTT_SUBSCRIBE_TOPIC", "wesense/decoded/#")
 
-# ClickHouse columns (25-column unified schema)
+# ClickHouse columns (30-column unified schema)
 BRIDGE_COLUMNS = [
-    "timestamp", "device_id", "data_source", "network_source", "ingestion_node_id",
+    "timestamp", "device_id", "data_source", "data_source_name",
+    "network_source", "ingestion_node_id",
     "reading_type", "value", "unit",
     "latitude", "longitude", "altitude", "geo_country", "geo_subdivision",
-    "board_model", "sensor_model", "deployment_type", "deployment_type_source",
-    "transport_type", "deployment_location", "node_name", "node_info", "node_info_url",
+    "board_model", "sensor_model", "calibration_status",
+    "deployment_type", "deployment_type_source",
+    "transport_type", "location_source",
+    "deployment_location", "node_name", "node_info", "node_info_url",
     "signature", "ingester_id", "key_version",
     "received_via",
+    "data_license",
 ]
 
 
@@ -116,7 +123,7 @@ class ZenohBridge:
     """
     Bidirectional MQTT ↔ Zenoh bridge.
 
-    Outbound: MQTT decoded/# → sign → Zenoh wesense/v2/live/**
+    Outbound: MQTT decoded/# → preserve signature → Zenoh wesense/v2/live/**
     Inbound:  Zenoh wesense/v2/live/** → verify → ClickHouse (received_via=p2p)
     """
 
@@ -264,6 +271,7 @@ class ZenohBridge:
             "self_echo": 0,
             "mqtt_received": 0,
             "mqtt_published": 0,
+            "unsigned_mqtt": 0,
         }
 
     # ── Outbound: MQTT → Zenoh ────────────────────────────────────────
@@ -311,7 +319,7 @@ class ZenohBridge:
         self.logger.warning("MQTT outbound bridge disconnected (rc=%s)", rc)
 
     def _mqtt_on_message(self, client, userdata, msg):
-        """Forward decoded MQTT reading to Zenoh."""
+        """Forward decoded MQTT reading to Zenoh, preserving original signature."""
         self.stats["mqtt_received"] += 1
 
         try:
@@ -322,9 +330,46 @@ class ZenohBridge:
         if not isinstance(reading, dict) or not reading.get("device_id"):
             return
 
+        # The MQTT message from ReadingPipeline is {**canonical, **sig_fields}.
+        # Extract the original signature metadata placed by the ingester.
+        sig_hex = reading.get("signature", "")
+        orig_ingester_id = reading.get("ingester_id", "")
+        orig_key_version = reading.get("key_version", 0)
+
+        if not sig_hex or not orig_ingester_id:
+            # Unsigned reading — cannot forward without a valid signature
+            self.stats["unsigned_mqtt"] += 1
+            return
+
         if self.zenoh_publisher and self.zenoh_publisher.is_connected():
-            if self.zenoh_publisher.publish_reading(reading):
+            # Reconstruct the canonical payload that was signed by the ingester.
+            # The signature covers exactly the CANONICAL_FIELDS dict serialised
+            # with sort_keys=True — strip signature metadata to recover it.
+            canonical = {k: reading[k] for k in CANONICAL_FIELDS if k in reading}
+            payload_bytes = canonical_to_json(canonical)
+
+            # Wrap in SignedReading protobuf with the ORIGINAL ingester signature
+            envelope = SignedReading(
+                payload=payload_bytes,
+                signature=bytes.fromhex(sig_hex),
+                ingester_id=orig_ingester_id,
+                key_version=orig_key_version,
+            )
+
+            # Publish to Zenoh using the publisher's session directly
+            country = (reading.get("geo_country") or "unknown").lower()
+            subdivision = (reading.get("geo_subdivision") or "unknown").lower()
+            device_id = reading.get("device_id") or "unknown"
+            key_expr = self.zenoh_publisher.config.build_key_expr(
+                country, subdivision, device_id,
+            )
+
+            try:
+                pub = self.zenoh_publisher._get_or_create_publisher(key_expr)
+                pub.put(envelope.SerializeToString())
                 self.stats["mqtt_published"] += 1
+            except Exception as e:
+                self.logger.error("Failed to publish to Zenoh: %s", e)
 
     # ── Inbound: Zenoh → ClickHouse ──────────────────────────────────
 
@@ -377,10 +422,15 @@ class ZenohBridge:
         except (ValueError, TypeError):
             return
 
+        # Map sensor_transport → transport_type (canonical uses sensor_transport,
+        # ClickHouse column is transport_type)
+        transport_type = reading_dict.get("transport_type") or reading_dict.get("sensor_transport") or ""
+
         row = (
             ts,
             device_id,
             reading_dict.get("data_source") or "",
+            reading_dict.get("data_source_name") or "",
             reading_dict.get("network_source") or "",
             reading_dict.get("ingestion_node_id") or "",
             reading_type,
@@ -393,9 +443,11 @@ class ZenohBridge:
             reading_dict.get("geo_subdivision") or "",
             reading_dict.get("board_model") or "",
             reading_dict.get("sensor_model") or "",
+            reading_dict.get("calibration_status") or "",
             reading_dict.get("deployment_type") or "",
             reading_dict.get("deployment_type_source") or "",
-            reading_dict.get("transport_type") or "",
+            transport_type,
+            reading_dict.get("location_source") or "",
             reading_dict.get("deployment_location"),
             reading_dict.get("node_name"),
             reading_dict.get("node_info"),
@@ -404,6 +456,7 @@ class ZenohBridge:
             ingester_id,
             key_version,
             "p2p",
+            reading_dict.get("data_license") or "CC-BY-4.0",
         )
         self.ch_writer.add(row)
         self.stats["written"] += 1
@@ -488,7 +541,7 @@ class ZenohBridge:
 
         self.logger.info(
             "STATS | inbound: received=%d written=%d duplicates=%d self_echo=%d unsigned=%d | "
-            "outbound: mqtt_received=%d zenoh_published=%d | "
+            "outbound: mqtt_received=%d zenoh_published=%d unsigned_mqtt=%d | "
             "sub_verified=%d sub_rejected=%d | ch_written=%d ch_buffer=%d | remote_peers=%d",
             self.stats["received"],
             self.stats["written"],
@@ -497,6 +550,7 @@ class ZenohBridge:
             self.stats["unsigned"],
             self.stats["mqtt_received"],
             self.stats["mqtt_published"],
+            self.stats["unsigned_mqtt"],
             sub_stats.get("verified", 0),
             sub_stats.get("rejected", 0),
             ch_stats.get("total_written", 0),
@@ -543,6 +597,7 @@ class ZenohBridge:
             "unsigned": self.stats["unsigned"],
             "mqtt_received": self.stats["mqtt_received"],
             "mqtt_published": self.stats["mqtt_published"],
+            "unsigned_mqtt": self.stats["unsigned_mqtt"],
             "sub_verified": sub_stats.get("verified", 0),
             "sub_rejected": sub_stats.get("rejected", 0),
             "ch_written": ch_stats.get("total_written", 0),
