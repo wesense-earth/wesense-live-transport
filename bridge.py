@@ -734,6 +734,23 @@ class ZenohBridge:
         self.logger.info("Bridge identity: %s", self._key_manager.ingester_id)
         self.logger.info("=" * 60)
 
+        # Wait for the initial OrbitDB trust sync to complete before we start
+        # accepting P2P readings. Without this, a freshly-deployed station
+        # would reject valid readings from known ingesters during the cold-
+        # start window because its local trust store is empty. The trust
+        # sync is already running in the background (started by the
+        # RegistryClient); we just block until its first pass is done.
+        if self.registry_client is not None:
+            self.logger.info("Waiting for initial OrbitDB trust sync…")
+            if self.registry_client.wait_for_initial_sync(timeout=60.0):
+                self.logger.info("Initial trust sync complete — starting Zenoh subscriber")
+            else:
+                self.logger.warning(
+                    "Initial trust sync did not complete within 60s — "
+                    "proceeding with empty/stale trust store. Readings from "
+                    "unknown ingesters will be rejected until sync succeeds."
+                )
+
         # Start inbound Zenoh subscriber
         self.subscriber.connect()
         self.subscriber.subscribe(SUBSCRIBE_KEY)
