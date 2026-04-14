@@ -342,11 +342,23 @@ class ZenohBridge:
         sig_hex = reading.get("signature", "")
         orig_ingester_id = reading.get("ingester_id", "")
         orig_key_version = reading.get("key_version", 0)
+        orig_public_key_b64 = reading.get("public_key", "")
 
         if not sig_hex or not orig_ingester_id:
             # Unsigned reading — cannot forward without a valid signature
             self.stats["unsigned_mqtt"] += 1
             return
+
+        # Decode the base64 public key into raw bytes for the protobuf envelope.
+        # Empty (no public_key in MQTT message) is tolerated for rolling-upgrade
+        # scenarios where the sending ingester is on older code.
+        orig_public_key_bytes = b""
+        if orig_public_key_b64:
+            try:
+                import base64 as _b64
+                orig_public_key_bytes = _b64.b64decode(orig_public_key_b64)
+            except Exception:
+                orig_public_key_bytes = b""
 
         if self.zenoh_publisher and self.zenoh_publisher.is_connected():
             # Reconstruct the canonical payload that was signed by the ingester.
@@ -366,11 +378,14 @@ class ZenohBridge:
             payload_bytes = canonical_to_json(canonical)
 
             # Wrap in SignedReading protobuf with the ORIGINAL ingester signature
+            # AND the ORIGINAL ingester public key — so remote stations can
+            # verify the signature without a live trust store lookup.
             envelope = SignedReading(
                 payload=payload_bytes,
                 signature=bytes.fromhex(sig_hex),
                 ingester_id=orig_ingester_id,
                 key_version=orig_key_version,
+                public_key=orig_public_key_bytes,
             )
 
             # Publish to Zenoh using the publisher's session directly
@@ -440,12 +455,22 @@ class ZenohBridge:
             signature = signed_reading.signature.hex()
             ingester_id = signed_reading.ingester_id
             key_version = signed_reading.key_version
+            # public_key is optional in the protobuf (proto3 defaults to empty
+            # bytes). Base64-encode for storage in the LowCardinality(String)
+            # ClickHouse column. Empty value tolerated for older senders that
+            # don't yet populate this field.
+            if signed_reading.public_key:
+                import base64 as _b64
+                public_key_b64 = _b64.b64encode(signed_reading.public_key).decode("ascii")
+            else:
+                public_key_b64 = ""
         else:
             # Unsigned reading — still store but flag
             self.stats["unsigned"] += 1
             signature = ""
             ingester_id = ""
             key_version = 0
+            public_key_b64 = ""
 
         # Parse timestamp
         try:
@@ -500,7 +525,7 @@ class ZenohBridge:
             "p2p",
             reading_dict.get("data_license") or "CC-BY-4.0",
             int(reading_dict.get("signing_payload_version") or 1),
-            reading_dict.get("public_key") or "",
+            public_key_b64,
         )
         self.ch_writer.add(row)
         self.stats["written"] += 1
