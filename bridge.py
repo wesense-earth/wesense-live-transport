@@ -405,25 +405,29 @@ class ZenohBridge:
         reading_type = reading_dict.get("reading_type", "")
         timestamp = reading_dict.get("timestamp", 0)
 
-        # Version skew check — log a warning if we're receiving readings
-        # signed under a canonical version we don't understand yet. The
-        # reading is still stored (operator may upgrade later and verify then),
-        # but visibility is important.
+        # Forward rejection — refuse readings signed under a canonical
+        # version this station doesn't understand yet. Dropping the reading
+        # entirely (rather than storing a partial interpretation) is what
+        # guarantees that every station which ACCEPTS a reading produces a
+        # byte-identical archive for it. See data-integrity.md §"How Version
+        # Skew Is Handled: Forward Rejection".
         incoming_version = int(reading_dict.get("signing_payload_version") or 1)
         if incoming_version > CURRENT_CANONICAL_VERSION:
-            self.stats.setdefault("newer_version_received", 0)
-            self.stats["newer_version_received"] += 1
-            # Rate-limit by only logging first occurrence per session per version
+            self.stats.setdefault("rejected_newer_version", 0)
+            self.stats["rejected_newer_version"] += 1
+            # Rate-limit: log first occurrence per session per version
             seen_key = f"_warned_newer_v{incoming_version}"
             if not getattr(self, seen_key, False):
                 setattr(self, seen_key, True)
                 self.logger.warning(
-                    "Received reading with signing_payload_version=%d from ingester %s, "
-                    "but this station only supports up to v%d. Upgrade to verify newer readings.",
+                    "REJECTING readings with signing_payload_version=%d from ingester %s — "
+                    "this station only supports up to v%d. Upgrade this station to "
+                    "accept and archive newer data.",
                     incoming_version,
                     reading_dict.get("ingester_id", "?"),
                     CURRENT_CANONICAL_VERSION,
                 )
+            return  # do not write to ClickHouse, do not archive
 
         # Dedup check
         if self.dedup.is_duplicate(device_id, reading_type, timestamp):
