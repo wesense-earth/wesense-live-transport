@@ -77,7 +77,7 @@ MQTT_SUBSCRIBE_TOPIC = os.getenv("MQTT_SUBSCRIBE_TOPIC", "wesense/decoded/#")
 BRIDGE_COLUMNS = [
     "timestamp", "device_id", "data_source", "data_source_name",
     "network_source", "ingestion_node_id",
-    "reading_type", "value", "unit",
+    "reading_type", "reading_type_name", "value", "unit",
     "latitude", "longitude", "altitude", "geo_country", "geo_subdivision",
     "board_model", "sensor_model", "calibration_status",
     "deployment_type", "deployment_type_source",
@@ -439,6 +439,7 @@ class ZenohBridge:
             reading_dict.get("network_source") or "",
             reading_dict.get("ingestion_node_id") or "",
             reading_type,
+            reading_dict.get("reading_type_name") or "",
             value,
             reading_dict.get("unit") or "",
             float(reading_dict["latitude"]) if reading_dict.get("latitude") is not None else None,
