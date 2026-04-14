@@ -39,7 +39,7 @@ from wesense_ingester import (
     setup_logging,
 )
 from wesense_ingester.clickhouse.writer import ClickHouseConfig
-from wesense_ingester.pipeline import CANONICAL_FIELDS, canonical_to_json
+from wesense_ingester.pipeline import CANONICAL_FIELDS, build_canonical, canonical_to_json
 from wesense_ingester.proto.signed_reading_pb2 import SignedReading
 from wesense_ingester.signing.keys import IngesterKeyManager, KeyConfig
 from wesense_ingester.signing.signer import ReadingSigner
@@ -342,10 +342,15 @@ class ZenohBridge:
             return
 
         if self.zenoh_publisher and self.zenoh_publisher.is_connected():
-            # Reconstruct the canonical payload that was signed by the ingester.
-            # The signature covers exactly the CANONICAL_FIELDS dict serialised
-            # with sort_keys=True — strip signature metadata to recover it.
-            canonical = {k: reading[k] for k in CANONICAL_FIELDS if k in reading}
+            # Reconstruct the canonical payload that was signed by the ingester
+            # using the same build_canonical() the ingester called — ensures
+            # identical types and serialisation to what was signed.
+            try:
+                canonical = build_canonical(reading)
+            except (KeyError, ValueError, TypeError) as e:
+                self.logger.debug("Could not rebuild canonical from MQTT reading: %s", e)
+                self.stats["unsigned_mqtt"] += 1
+                return
             payload_bytes = canonical_to_json(canonical)
 
             # Wrap in SignedReading protobuf with the ORIGINAL ingester signature
