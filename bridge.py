@@ -92,6 +92,7 @@ BRIDGE_COLUMNS = [
     "received_via",
     "data_license",
     "signing_payload_version",
+    "public_key",
 ]
 
 
@@ -499,6 +500,7 @@ class ZenohBridge:
             "p2p",
             reading_dict.get("data_license") or "CC-BY-4.0",
             int(reading_dict.get("signing_payload_version") or 1),
+            reading_dict.get("public_key") or "",
         )
         self.ch_writer.add(row)
         self.stats["written"] += 1
