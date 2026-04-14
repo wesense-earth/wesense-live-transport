@@ -39,7 +39,12 @@ from wesense_ingester import (
     setup_logging,
 )
 from wesense_ingester.clickhouse.writer import ClickHouseConfig
-from wesense_ingester.pipeline import CANONICAL_FIELDS, build_canonical, canonical_to_json
+from wesense_ingester.pipeline import (
+    CANONICAL_FIELDS,
+    CURRENT_CANONICAL_VERSION,
+    build_canonical,
+    canonical_to_json,
+)
 from wesense_ingester.proto.signed_reading_pb2 import SignedReading
 from wesense_ingester.signing.keys import IngesterKeyManager, KeyConfig
 from wesense_ingester.signing.signer import ReadingSigner
@@ -86,6 +91,7 @@ BRIDGE_COLUMNS = [
     "signature", "ingester_id", "key_version",
     "received_via",
     "data_license",
+    "signing_payload_version",
 ]
 
 
@@ -342,13 +348,18 @@ class ZenohBridge:
             return
 
         if self.zenoh_publisher and self.zenoh_publisher.is_connected():
-            # Reconstruct the canonical payload that was signed by the ingester
-            # using the same build_canonical() the ingester called — ensures
-            # identical types and serialisation to what was signed.
+            # Reconstruct the canonical payload that was signed by the ingester.
+            # Use the reading's own signing_payload_version so we reproduce
+            # the exact bytes the ingester signed, regardless of what version
+            # this bridge itself considers current.
+            signing_version = int(reading.get("signing_payload_version") or 1)
             try:
-                canonical = build_canonical(reading)
+                canonical = build_canonical(reading, version=signing_version)
             except (KeyError, ValueError, TypeError) as e:
-                self.logger.debug("Could not rebuild canonical from MQTT reading: %s", e)
+                self.logger.debug(
+                    "Could not rebuild canonical v%d from MQTT reading: %s",
+                    signing_version, e,
+                )
                 self.stats["unsigned_mqtt"] += 1
                 return
             payload_bytes = canonical_to_json(canonical)
@@ -393,6 +404,26 @@ class ZenohBridge:
         device_id = reading_dict.get("device_id", "")
         reading_type = reading_dict.get("reading_type", "")
         timestamp = reading_dict.get("timestamp", 0)
+
+        # Version skew check — log a warning if we're receiving readings
+        # signed under a canonical version we don't understand yet. The
+        # reading is still stored (operator may upgrade later and verify then),
+        # but visibility is important.
+        incoming_version = int(reading_dict.get("signing_payload_version") or 1)
+        if incoming_version > CURRENT_CANONICAL_VERSION:
+            self.stats.setdefault("newer_version_received", 0)
+            self.stats["newer_version_received"] += 1
+            # Rate-limit by only logging first occurrence per session per version
+            seen_key = f"_warned_newer_v{incoming_version}"
+            if not getattr(self, seen_key, False):
+                setattr(self, seen_key, True)
+                self.logger.warning(
+                    "Received reading with signing_payload_version=%d from ingester %s, "
+                    "but this station only supports up to v%d. Upgrade to verify newer readings.",
+                    incoming_version,
+                    reading_dict.get("ingester_id", "?"),
+                    CURRENT_CANONICAL_VERSION,
+                )
 
         # Dedup check
         if self.dedup.is_duplicate(device_id, reading_type, timestamp):
@@ -463,6 +494,7 @@ class ZenohBridge:
             key_version,
             "p2p",
             reading_dict.get("data_license") or "CC-BY-4.0",
+            int(reading_dict.get("signing_payload_version") or 1),
         )
         self.ch_writer.add(row)
         self.stats["written"] += 1
