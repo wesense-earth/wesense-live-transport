@@ -181,4 +181,8 @@ jobs:
           image-names: ${{ github.event.repository.name }}
           cut-off: 7d
           keep-n-most-recent: 3
-          tag-selection: both
+          # Only reap orphaned digests (previous versions of moving tags like
+          # :dev, :main, :latest that were superseded by a new build). All
+          # tagged images — including semver release tags — are preserved
+          # forever so deploys of older releases never break.
+          tag-selection: untagged
