@@ -1,23 +1,31 @@
 name: Dependabot auto-merge
 
-# Turns on GitHub auto-merge for Dependabot PRs that are security fixes or
-# patch-level bumps. The PR still has to pass the required checks on main
-# (see branch protection) before GitHub merges it. Minor and major bumps are
-# left for a human. Details: https://docs.wesense.earth/developers/dependency-updates
+# Merges Dependabot PRs that are security fixes or patch-level bumps, once the
+# required checks on main have passed, then starts the build so the fix is
+# published. Minor and major bumps are left for a human.
+# Details: https://docs.wesense.earth/developers/dependency-updates
 
-on:
-  pull_request:
-    types: [opened, synchronize, reopened, closed]
+on: pull_request
 
 permissions:
   contents: write
   pull-requests: write
   actions: write
+  checks: read
+
+# A new push to the PR (for example a Dependabot rebase) replaces the old wait.
+concurrency:
+  group: automerge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   automerge:
-    if: github.event.action != 'closed' && github.actor == 'dependabot[bot]'
+    if: github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_URL: ${{ github.event.pull_request.html_url }}
     steps:
       - name: Read Dependabot metadata
         id: meta
@@ -25,26 +33,22 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Enable auto-merge (security fix or patch bump)
+      - name: Wait for the required checks
+        id: eligible
         if: steps.meta.outputs.alert-state != '' || steps.meta.outputs.update-type == 'version-update:semver-patch'
-        run: gh pr merge --auto --squash "$PR_URL"
-        env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Give the other workflows time to register their checks first.
+          sleep 90
+          gh pr checks "$PR_URL" --required --watch --interval 30
 
-  # A merge made by auto-merge uses the built-in token, and GitHub does not
-  # start push workflows for those. Start the build by hand so the fix is
-  # published. (workflow_dispatch is the one trigger the built-in token may use.)
-  publish:
-    if: >-
-      github.event.action == 'closed' &&
-      github.event.pull_request.merged == true &&
-      github.event.pull_request.user.login == 'dependabot[bot]' &&
-      github.event.pull_request.merged_by.login == 'github-actions[bot]'
-    runs-on: ubuntu-latest
-    steps:
+      - name: Merge
+        if: steps.eligible.outcome == 'success'
+        run: gh pr merge --squash "$PR_URL"
+
+      # Merges made with the built-in token do not trigger push workflows, so
+      # start the build by hand. (workflow_dispatch is the one trigger the
+      # built-in token may use.)
       - name: Start the build on main
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        if: steps.eligible.outcome == 'success'
         run: |
           gh workflow run docker-build.yml --repo "$GITHUB_REPOSITORY" --ref main
