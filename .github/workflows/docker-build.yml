@@ -37,14 +37,14 @@ jobs:
         run: echo "ref=${{ github.head_ref || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout ingester
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.core-branch.outputs.ref }}
           path: wesense-live-transport
 
       - name: Checkout core library (matching branch, fallback to main)
         id: checkout-core
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: wesense-earth/wesense-ingester-core
           token: ${{ secrets.CORE_REPO_TOKEN || github.token }}
@@ -54,7 +54,7 @@ jobs:
 
       - name: Fallback to core main branch
         if: steps.checkout-core.outcome == 'failure'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: wesense-earth/wesense-ingester-core
           token: ${{ secrets.CORE_REPO_TOKEN || github.token }}
@@ -62,11 +62,11 @@ jobs:
           path: wesense-ingester-core
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to Container Registry
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -74,7 +74,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
@@ -85,7 +85,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: wesense-live-transport/Dockerfile
@@ -105,7 +105,7 @@ jobs:
 
       - name: Upload digest
         if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: digests-${{ steps.slug.outputs.slug }}
           path: /tmp/digests/*
@@ -122,14 +122,14 @@ jobs:
 
     steps:
       - name: Checkout wesense-live-transport
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.head_ref || github.ref_name }}
           path: wesense-live-transport
 
       - name: Checkout core library (matching branch, fallback to main)
         id: checkout-core
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: wesense-earth/wesense-ingester-core
           token: ${{ secrets.CORE_REPO_TOKEN || github.token }}
@@ -139,17 +139,17 @@ jobs:
 
       - name: Fallback to core main branch
         if: steps.checkout-core.outcome == 'failure'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: wesense-earth/wesense-ingester-core
           token: ${{ secrets.CORE_REPO_TOKEN || github.token }}
           ref: main
           path: wesense-ingester-core
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Build image (linux/amd64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: wesense-live-transport/Dockerfile
@@ -173,17 +173,17 @@ jobs:
 
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
           pattern: digests-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -195,7 +195,7 @@ jobs:
 
       - name: Extract metadata (tags)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
