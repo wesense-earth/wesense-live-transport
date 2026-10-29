@@ -228,7 +228,7 @@ jobs:
 
     steps:
       - name: Clean up old package versions
-        uses: snok/container-retention-policy@v3.0.1
+        uses: snok/container-retention-policy@v3.1.0
         with:
           account: ${{ github.repository_owner }}
           token: ${{ secrets.GITHUB_TOKEN }}
