@@ -35,7 +35,8 @@ jobs:
 
       - name: Wait for the required checks
         id: eligible
-        if: steps.meta.outputs.alert-state != '' || steps.meta.outputs.update-type == 'version-update:semver-patch'
+        # Security fixes: routine minor and patch updates are always grouped (see dependabot.yml) and security updates never are, so an ungrouped minor is a security fix. alert-state needs a PAT, so it is not used.
+        if: steps.meta.outputs.update-type == 'version-update:semver-patch' || (steps.meta.outputs.dependency-group == '' && steps.meta.outputs.update-type == 'version-update:semver-minor')
         run: |
           # Give the other workflows time to register their checks first.
           sleep 90
