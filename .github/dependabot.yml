@@ -6,6 +6,12 @@ updates:
       interval: "weekly"
       day: "monday"
     open-pull-requests-limit: 5
+    ignore:
+      # Python minor versions change behaviour (3.13+ rejects the deployment
+      # CA's certificates), so moving Python is a deliberate change, not a
+      # weekly bump. Patch releases of the pinned minor still come through.
+      - dependency-name: "python"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
     groups:
       minor-and-patch:
         update-types: ["minor", "patch"]
